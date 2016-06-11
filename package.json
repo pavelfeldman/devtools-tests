@@ -1,0 +1,27 @@
+{
+  "name": "devtools-tests",
+  "version": "1.0.0",
+  "description": "DevTools front-end test harness",
+  "bin": "runner.js",
+  "engines": {
+    "node": ">=5"
+  },
+  "scripts": {
+    "start": "node runner.js"
+  },
+  "repository": "pavelfeldman/devtools-tests",
+  "keywords": [
+    "google",
+    "chrome",
+    "devtools"
+  ],
+  "author": "The Chromium Authors",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/pavelfeldman/devtools-tests/issues"
+  },
+  "dependencies": {
+    "minimist": "^1.2.0",
+    "ws": "^1.1.0"
+  }
+}
