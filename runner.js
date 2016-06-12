@@ -20,6 +20,7 @@ function Frontend(frontend, backend)
     this._connection.on("notification", this._handleNotification.bind(this));
     this._inspectedConnection = backend.fork("                                             inspected");
     this._inspectedConnection.on("notification", this._dispatchMessageFromBackend.bind(this));
+    this._pendingEvaluateInWebInspector = [];
 }
 
 Frontend.prototype = {
@@ -41,7 +42,6 @@ Frontend.prototype = {
     reload(testPath)
     {
         this._testPath = testPath;
-        this._pendingEvaluateInWebInspector = [];
         this._readyForTest = false;
         var settings = JSON.stringify({testPath : testPath});
         this._connection.sendCommand("Page.navigate", { url: frontendPath });
@@ -50,7 +50,7 @@ Frontend.prototype = {
 
     disconnect: function()
     {
-        this._disconnected = true;
+        this._pendingEvaluateInWebInspector = [];
     },
 
     evaluateInWebInspector: function(code)
@@ -86,7 +86,12 @@ Frontend.prototype = {
             var setting = JSON.stringify({testPath: this._testPath});
             this._connection.sendCommand("Runtime.evaluate", { expression: "(" + setTestPath + ")(\"" + this._testPath + "\")" });
         } else if (command.method === "sendMessageToBackend") {
-            this._inspectedConnection.sendCommandObject(JSON.parse(command.args[0])).then(this._dispatchMessageFromBackend.bind(this));
+            var parsedCommand;
+            try {
+                parsedCommand = JSON.parse(command.args[0]);
+            } catch(e) {
+            }
+            this._inspectedConnection.sendCommandObject(parsedCommand).then(this._dispatchMessageFromBackend.bind(this));
         } else if (command.method === "readyForTest") {
             this._readyForTest = true;
             this.evaluateInWebInspector(null);
@@ -99,37 +104,52 @@ Frontend.prototype = {
     }
 }
 
-function TestRunner(frontend, backend)
+function TestRunner(backend)
 {
-    this._frontend = frontend;
-    this._connection = backend.fork("testRunner");
-    this._connection.on("notification", this._dispatchNotification.bind(this));
     this._successCount = 0;
     this._failedCount = 0;
     this._timedOutCount = 0;
 }
 
 TestRunner.prototype = {
-    runTest(testPath, callback)
+    init: function()
+    {
+        return Promise.all([server.newTab(), server.newTab()]).then(mixers => {
+            this._connection = mixers[1].fork("testRunner");
+            this._connection.on("notification", this._dispatchNotification.bind(this));
+            this._frontend = new Frontend(mixers[0], mixers[1]);
+            return this._frontend.init();
+        });
+    },
+
+    runTests(paths)
+    {
+        if (!paths.length)
+            process.exit(0);
+        var testPath = paths.shift();
+        console.log("Running " + testPath + "...");
+        this._runTest(testPath, this.runTests.bind(this, paths));
+    },
+
+    _runTest(testPath, callback)
     {
         this._watchdog = setTimeout(this._timeout.bind(this), 5000);
 
-        this._testDone = false;
-        this._callback = callback;
-
         // Reattach to reset backend state.
-        ["Runtime", "Debugger", "Console", "Profiler", "HeapProfiler", "CSS", "DOM"].forEach(item => {
-            this._connection.sendCommand(item + ".disable");
-        });
-        this._connection.sendCommand("Page.enable");
-        this._connection.sendCommand("Console.enable");
-        this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(() => {
-            var expectationsPath = testPath.replace(".html", "-expected.txt");
-            fs.readFile(expectationsPath, "utf8", (err, data) => {
-                var lines = data.split("\n");
-                lines = lines.filter(line => !line.startsWith("CONSOLE MESSAGE"));
-                this._expected = lines.join("\n");
-                this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+        this._connection.reset().then(() => {
+            this._connection.sendCommand("Page.enable");
+            this._connection.sendCommand("Console.enable");
+            this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(() => {
+                var expectationsPath = testPath.replace(".html", "-expected.txt");
+                fs.readFile(expectationsPath, "utf8", (err, data) => {
+                    var lines = data.split("\n");
+                    lines = lines.filter(line => !line.startsWith("CONSOLE MESSAGE"));
+                    this._expected = lines.join("\n");
+                    this._testDone = false;
+                    this._callback = callback;
+                    this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+                    this._frontend.reload(testPath);
+                });
             });
         });
     },
@@ -149,7 +169,9 @@ TestRunner.prototype = {
             // Page could override stringify.
             command = JSON.parse(text.substring("#devtools-tests#".length));
         } catch (e) {
+            this._completeTest();
             this._fail();
+            this._callback();
             return;
         }
 
@@ -162,8 +184,10 @@ TestRunner.prototype = {
                 var actual = response.result.result.value + "\n";
                 if (actual === this._expected) {
                     this._succeed();
+                    this._callback();
                 } else {
                     this._fail();
+                    this._callback();
                     // var dmp = new diff_match_patch();
                     // var a = dmp.diff_linesToChars_(this._expected, actual);
                     // var diffs = dmp.diff_main(a.chars1, a.chars2, false);
@@ -194,18 +218,14 @@ TestRunner.prototype = {
 
     _succeed()
     {
-        this._completeTest();
         this._successCount++;
         console.log("SUCCESS " + this._stats());
-        this._callback();
     },
 
     _fail()
     {
-        this._completeTest();
         this._failedCount++;
         console.log("FAILED " + this._stats());
-        this._callback();
     },
 
     _timeout()
@@ -217,8 +237,6 @@ TestRunner.prototype = {
     }
 }
 
-var frontend;
-var testRunner;
 var tests = [];
 
 function collectFiles(path)
@@ -241,25 +259,15 @@ function collectFiles(path)
     });
 }
 
+var testRunner = new TestRunner();
+
 Promise.all(testPaths.map(path => collectFiles(path))).then(() => {
     console.log("Running " + tests.length + " tests...");
     server.closeTabs().then(() => {
         setTimeout(() => {
-            Promise.all([server.newTab(), server.newTab()]).then(mixers => {
-                frontend = new Frontend(mixers[0], mixers[1]);
-                testRunner = new TestRunner(frontend, mixers[1]);
-                frontend.init().then(runTests);
+            testRunner.init().then(() => {
+                testRunner.runTests(tests);
             });
         }, 1000);
     });
 });
-
-function runTests()
-{
-    if (!tests.length)
-        process.exit(0);
-    var testPath = tests.shift();
-    console.log("Running " + testPath + "...");
-    frontend.reload(testPath);
-    testRunner.runTest(testPath, runTests);
-}

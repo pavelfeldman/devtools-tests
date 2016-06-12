@@ -14,23 +14,12 @@ module.exports = {
     Server: RDPServer
 }
 
-function RDPConnectionMixer(ws)
+function RDPConnectionMixer(wsurl)
 {
     this._id = 0;
     this._requests = new Map();
-    this._ws = ws;
-    this._ws.on("message", message => this._dispatchMessage(message));
+    this._wsurl = wsurl;
     this._forkedConnections = new Set();
-}
-
-RDPConnectionMixer.connect = function(wsurl)
-{
-    return new Promise((fulfill, reject) => {
-        var ws = new WebSocket(wsurl);
-        ws.on("open", () => {
-            fulfill(new RDPConnectionMixer(ws));
-        });
-    });
 }
 
 RDPConnectionMixer.prototype = {
@@ -39,6 +28,20 @@ RDPConnectionMixer.prototype = {
         var connection = new RDPConnection(this, name);
         this._forkedConnections.add(connection);
         return connection;
+    },
+
+    reset: function()
+    {
+        if (this._ws)
+            this._ws.close();
+        this._id = 0;
+        this._requests.clear();
+
+        this._ws = new WebSocket(this._wsurl);
+        this._ws.on("message", message => this._dispatchMessage(message));
+        return new Promise((fulfill, reject) => {
+            this._ws.on("open", fulfill);
+        });
     },
 
     release: function(connection)
@@ -82,6 +85,13 @@ function RDPConnection(mixer, name)
 }
 
 RDPConnection.prototype = {
+    reset: function()
+    {
+        if (log)
+            console.log(this._name + " ==== [RESET] ===");
+        return this._mixer.reset();
+    },
+
     sendCommand(method, params)
     {
         return this.sendCommandObject({
@@ -139,7 +149,8 @@ RDPServer.prototype = {
     {
         return this._sendRequest("new").then(result => {
             var wsurl = JSON.parse(result).webSocketDebuggerUrl;
-            return RDPConnectionMixer.connect(wsurl);
+            var mixer = new RDPConnectionMixer(wsurl);
+            return mixer.reset().then(() => mixer);
         });
     },
 
