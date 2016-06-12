@@ -6,14 +6,11 @@ var frontendPatch = require("./frontend_patch");
 var testRunnerPatch = require("./test_runner_patch");
 var fs = require("fs");
 var rdp = require("./rdp");
+eval(fs.readFileSync("./third_party/diff_match_patch/diff_match_patch.js", "utf8"));
 
 var argv = require('minimist')(process.argv.slice(2));
 var frontendPath = "http://localhost:" + argv["frontend_port"] + "/front_end/inspector.html";
-var testsPath = argv["layout_tests"] + "/inspector/elements";
-
-console.log("Frontend path: " + frontendPath);
-console.log("Tests path: " + testsPath);
-console.log("Chrome RDP path: " + "localhost:" + argv["chrome_port"]);
+var testPaths = argv["_"];
 
 var server = new rdp.Server("localhost", argv["chrome_port"]);
 
@@ -107,25 +104,33 @@ function TestRunner(frontend, backend)
     this._frontend = frontend;
     this._connection = backend.fork("testRunner");
     this._connection.on("notification", this._dispatchNotification.bind(this));
+    this._successCount = 0;
+    this._failedCount = 0;
+    this._timedOutCount = 0;
 }
 
 TestRunner.prototype = {
-    init()
-    {
-        this._connection.sendCommand("Console.enable");
-        this._connection.sendCommand("Page.enable");
-        return this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" });
-    },
-
     runTest(testPath, callback)
     {
-        this._watchdog = setTimeout(callback.bind(null, "TIMEOUT"), 5000);
+        this._watchdog = setTimeout(this._timeout.bind(this), 5000);
+
         this._testDone = false;
         this._callback = callback;
-        var expectationsPath = testPath.replace(".html", "-expected.txt");
-        fs.readFile(expectationsPath, "utf8", (err, data) => {
-            this._expected = data;
-            this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+
+        // Reattach to reset backend state.
+        ["Runtime", "Debugger", "Console", "Profiler", "HeapProfiler", "CSS", "DOM"].forEach(item => {
+            this._connection.sendCommand(item + ".disable");
+        });
+        this._connection.sendCommand("Page.enable");
+        this._connection.sendCommand("Console.enable");
+        this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(() => {
+            var expectationsPath = testPath.replace(".html", "-expected.txt");
+            fs.readFile(expectationsPath, "utf8", (err, data) => {
+                var lines = data.split("\n");
+                lines = lines.filter(line => !line.startsWith("CONSOLE MESSAGE"));
+                this._expected = lines.join("\n");
+                this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+            });
         });
     },
 
@@ -139,22 +144,76 @@ TestRunner.prototype = {
         if (!text.startsWith("#devtools-tests#"))
             return;
 
-        var command = JSON.parse(text.substring("#devtools-tests#".length));
+        var command;
+        try {
+            // Page could override stringify.
+            command = JSON.parse(text.substring("#devtools-tests#".length));
+        } catch (e) {
+            this._fail();
+            return;
+        }
+
         if (command.method === "evaluateInWebInspector") {
             this._frontend.evaluateInWebInspector(command.args[1]);
         } else if (command.method === "notifyDone") {
-            this._testDone = true;
-            this._frontend.disconnect();
-            clearTimeout(this._watchdog);
+            this._completeTest();
             this._connection.sendCommand("Runtime.enable");
             this._connection.sendCommand("Runtime.evaluate", { expression: "document.documentElement.innerText" }).then(response => {
                 var actual = response.result.result.value + "\n";
-                if (actual === this._expected)
-                    this._callback("SUCCESS");
-                else
-                    this._callback("FAILURE");
+                if (actual === this._expected) {
+                    this._succeed();
+                } else {
+                    this._fail();
+                    // var dmp = new diff_match_patch();
+                    // var a = dmp.diff_linesToChars_(this._expected, actual);
+                    // var diffs = dmp.diff_main(a.chars1, a.chars2, false);
+                    // dmp.diff_charsToLines_(diffs, a.lineArray);
+                    // var diffText = "";
+                    // for (var diff of diffs) {
+                    //     if (diff[0] === 1)
+                    //         diffText += "\n+" + diff[1].split("\n").join("\n+");
+                    //     else if (diff[0] === -1)
+                    //         diffText += "\n-" + diff[1].split("\n").join("\n-");
+                    // }
+                }
             });
         }
+    },
+
+    _completeTest()
+    {
+        this._testDone = true;
+        this._frontend.disconnect();
+        clearTimeout(this._watchdog);
+    },
+
+    _stats()
+    {
+        return "S:" + this._successCount + " F:" + this._failedCount + " T:" + this._timedOutCount;
+    },
+
+    _succeed()
+    {
+        this._completeTest();
+        this._successCount++;
+        console.log("SUCCESS " + this._stats());
+        this._callback();
+    },
+
+    _fail()
+    {
+        this._completeTest();
+        this._failedCount++;
+        console.log("FAILED " + this._stats());
+        this._callback();
+    },
+
+    _timeout()
+    {
+        this._completeTest();
+        this._timedOutCount++;
+        console.log("TIMEOUT " + this._stats());
+        this._callback();
     }
 }
 
@@ -162,22 +221,37 @@ var frontend;
 var testRunner;
 var tests = [];
 
-server.closeTabs().then(() => {
-    setTimeout(() => {
-        Promise.all([server.newTab(), server.newTab()]).then(mixers => {
-            frontend = new Frontend(mixers[0], mixers[1]);
-            testRunner = new TestRunner(frontend, mixers[1]);
-            Promise.all([frontend.init(), testRunner.init()]).then(() => {
-                fs.readdir(testsPath, function(err, items) {
-                    for (var item of items) {
-                        if (item.endsWith(".html"))
-                            tests.push(testsPath + "/" + item);
-                    }
-                    runTests();
-                });
-            });
+function collectFiles(path)
+{
+    if (!fs.existsSync(path))
+        return Promise.resolve();
+    if (path.endsWith(".html")) {
+        tests.push(path);
+        return Promise.resolve();
+    }
+    if (!fs.lstatSync(path).isDirectory() || path.endsWith("/resources"))
+        return Promise.resolve();
+
+    return new Promise((fulfill, reject) => {
+        fs.readdir(path, (err, items) => {
+            if (!items)
+                return Promise.resolve();
+            Promise.all(items.map(item => collectFiles(path + "/" + item))).then(fulfill);
         });
-    }, 1000);
+    });
+}
+
+Promise.all(testPaths.map(path => collectFiles(path))).then(() => {
+    console.log("Running " + tests.length + " tests...");
+    server.closeTabs().then(() => {
+        setTimeout(() => {
+            Promise.all([server.newTab(), server.newTab()]).then(mixers => {
+                frontend = new Frontend(mixers[0], mixers[1]);
+                testRunner = new TestRunner(frontend, mixers[1]);
+                frontend.init().then(runTests);
+            });
+        }, 1000);
+    });
 });
 
 function runTests()
@@ -187,8 +261,5 @@ function runTests()
     var testPath = tests.shift();
     console.log("Running " + testPath + "...");
     frontend.reload(testPath);
-    testRunner.runTest(testPath, result => {
-        console.log(result);
-        runTests();
-    });
+    testRunner.runTest(testPath, runTests);
 }
