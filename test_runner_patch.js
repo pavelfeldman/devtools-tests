@@ -32,7 +32,7 @@ module.exports = function() {
 
         _send(method, args)
         {
-        	console.log("#devtools-tests#" + JSON.stringify({ method: method, args: args || {}}));
+            console.log("#devtools-tests#" + JSON.stringify({ method: method, args: args || {}}));
         }
     };
     window.testRunner = new TestRunner();

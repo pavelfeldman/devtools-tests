@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-module.exports = function(testPath) {
+module.exports = function() {
     /**
      * @constructor
      * @implements {InspectorFrontendHostAPI}
@@ -97,7 +97,6 @@ module.exports = function(testPath) {
 
         getPreferences: function(callback)
         {
-            this._prefs["testPath"] = JSON.stringify(testPath);
             callback(this._prefs);
         },
 

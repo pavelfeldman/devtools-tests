@@ -17,130 +17,178 @@ console.log("Chrome RDP path: " + "localhost:" + argv["chrome_port"]);
 
 var server = new rdp.Server("localhost", argv["chrome_port"]);
 
-function runTest(testPath)
+function Frontend(frontend, backend)
 {
-    return new Promise((fulfill, reject) => {
-	    var expectationsPath = testPath.replace(".html", "-expected.txt");
-		fs.readFile(expectationsPath, "utf8", (err, data) => {
-			server.closeTabs().then(() => {
-				setTimeout(() => { // FIXME: chrome bug !!!
-	               	Promise.all([server.newTab(), server.newTab()])
-	               	    .then(runTestWithConnections.bind(null, testPath, data, fulfill, reject));
-				}, 1000);
-			});
-		});
-    });
+    this._connection = frontend.fork("                                                                                                          frontend");
+    this._connection.on("notification", this._handleNotification.bind(this));
+    this._inspectedConnection = backend.fork("                                             inspected");
+    this._inspectedConnection.on("notification", this._dispatchMessageFromBackend.bind(this));
 }
 
-function runTestWithConnections(testPath, expectations, fulfill, reject, mixers)
-{
-	var tc = mixers[0].fork("testRunner");
-	var ic = mixers[0].fork("                                                                                                    inspected");
-	var fc = mixers[1].fork("                                                 frontend");
-	var frontendLoaded = false;
-	var testCompleted = false;
-	var watchdogTimer = setTimeout(reject, 10000);
-
-	tc.on("notification", notification => {
-		if (notification.method !== "Console.messageAdded")
-			return;
-		var text = notification.params.message.text;
-		if (!text.startsWith("#devtools-tests#"))
-			return;
-
-		var command = JSON.parse(text.substring("#devtools-tests#".length));
-		// console.log("test: " + command.method);
-		if (command.method === "evaluateInWebInspector") {
-			evaluateInWebInspector(command.args[1]);
-		}
-		else if (command.method === "notifyDone") {
-			testCompleted = true;
-    	    tc.sendCommand("Runtime.enable");
-			tc.sendCommand("Runtime.evaluate", { expression: "document.documentElement.innerText" }).then(response => {
-				var actual = response.result.result.value + "\n";
-				clearTimeout(watchdogTimer);
-				if (actual === expectations)
-					fulfill("SUCCESS");
-				else
-					fulfill("FAILURE");
-			});
-		}
-	});
-	tc.sendCommand("Console.enable");
-    tc.sendCommand("Page.enable");
-    tc.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(response => {
-	    tc.sendCommand("Page.navigate", { url: "file://" + testPath});
-    });
-
-	ic.on("notification", notification => {
-		fc.sendCommand("Runtime.evaluate", { expression: "InspectorFrontendHost.dispatchMessageOnFrontend(" + JSON.stringify(notification) + ")"});
-	});
-
-	fc.on("notification", notification => {
-		if (testCompleted)
-			return;
-		if (notification.method !== "Console.messageAdded")
-		    return;
-	    var text = notification.params.message.text;
-		if (!text.startsWith("#devtools-tests#"))
-			return;
-
-		var command = JSON.parse(text.substring("#devtools-tests#".length));
-		if (command.method === "sendMessageToBackend") {
-			if (command.args[0]) {
-				ic.sendCommandObject(JSON.parse(command.args[0])).then(response => {
-					fc.sendCommand("Runtime.evaluate", { expression: "InspectorFrontendHost.dispatchMessageOnFrontend(" + JSON.stringify(response) + ")"});
-				});
-			}
-		} else if (command.method === "readyForTest") {
-			frontendLoaded = true;
-			evaluateInWebInspector();
-		}
-	});
-
-    Promise.all([fc.sendCommand("Console.enable"),
-    	         fc.sendCommand("Page.enable"),
-//    	         fc.sendCommand("Network.setCacheDisabled", { cacheDisabled: true }),
-    	         fc.sendCommand("Runtime.enable")]).then(() => {
-	    fc.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + frontendPatch + ")('" + testPath + "')" }).then(response => {
-	    	// console.log(response);
-		    fc.sendCommand("Page.navigate", { url: frontendPath});
-	    });
-	});
-
-	var evaluateInWebInspectorCommands = [];
-    function evaluateInWebInspector(code)
+Frontend.prototype = {
+    init()
     {
-    	if (code)
-        	evaluateInWebInspectorCommands.push(code);
-    	if (!frontendLoaded || !evaluateInWebInspectorCommands.length)
-    		return;
-    	var payload = evaluateInWebInspectorCommands.shift();
-        fc.sendCommand("Runtime.evaluate", { expression: payload }).then(evaluateInWebInspector.bind(null, null));
+        return Promise.all([this._connection.sendCommand("Console.enable"),
+                     this._connection.sendCommand("Page.enable"),
+                     this._connection.sendCommand("Network.setCacheDisabled", { cacheDisabled: true }),
+                     this._connection.sendCommand("Runtime.enable")]).then(() => {
+            return this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + frontendPatch + ")()" });
+        });
+    },
+
+    setInspected(inspected)
+    {
+        this._inspected = inspected;
+    },
+
+    reload(testPath)
+    {
+        this._testPath = testPath;
+        this._pendingEvaluateInWebInspector = [];
+        this._readyForTest = false;
+        var settings = JSON.stringify({testPath : testPath});
+        this._connection.sendCommand("Page.navigate", { url: frontendPath });
+        this._disconnected = false;
+    },
+
+    disconnect: function()
+    {
+        this._disconnected = true;
+    },
+
+    evaluateInWebInspector: function(code)
+    {
+        if (code)
+            this._pendingEvaluateInWebInspector.push(code);
+        if (!this._readyForTest)
+            return;
+        for (var code of this._pendingEvaluateInWebInspector)
+            this._connection.sendCommand("Runtime.evaluate", { expression: code });
+        this._pendingEvaluateInWebInspector = [];
+    },
+
+    _dispatchMessageFromBackend: function(message)
+    {
+        if (this._disconnected)
+            return;
+        this._connection.sendCommand("Runtime.evaluate", { expression: "InspectorFrontendHost.dispatchMessageOnFrontend(" + JSON.stringify(message) + ")"});
+    },
+
+    _handleNotification(notification)
+    {
+        if (this._disconnected)
+            return;
+        if (notification.method !== "Console.messageAdded")
+            return;
+        var text = notification.params.message.text;
+        if (!text.startsWith("#devtools-tests#"))
+            return;
+
+        var command = JSON.parse(text.substring("#devtools-tests#".length));
+        if (command.method === "loadCompleted") {
+            var setting = JSON.stringify({testPath: this._testPath});
+            this._connection.sendCommand("Runtime.evaluate", { expression: "(" + setTestPath + ")(\"" + this._testPath + "\")" });
+        } else if (command.method === "sendMessageToBackend") {
+            this._inspectedConnection.sendCommandObject(JSON.parse(command.args[0])).then(this._dispatchMessageFromBackend.bind(this));
+        } else if (command.method === "readyForTest") {
+            this._readyForTest = true;
+            this.evaluateInWebInspector(null);
+        }
+
+        function setTestPath(testPath)
+        {
+            WebInspector.settings.createSetting("testPath", "").set(testPath);
+        }
     }
 }
 
+function TestRunner(frontend, backend)
+{
+    this._frontend = frontend;
+    this._connection = backend.fork("testRunner");
+    this._connection.on("notification", this._dispatchNotification.bind(this));
+}
+
+TestRunner.prototype = {
+    init()
+    {
+        this._connection.sendCommand("Console.enable");
+        this._connection.sendCommand("Page.enable");
+        return this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" });
+    },
+
+    runTest(testPath, callback)
+    {
+        this._watchdog = setTimeout(callback.bind(null, "TIMEOUT"), 5000);
+        this._testDone = false;
+        this._callback = callback;
+        var expectationsPath = testPath.replace(".html", "-expected.txt");
+        fs.readFile(expectationsPath, "utf8", (err, data) => {
+            this._expected = data;
+            this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+        });
+    },
+
+    _dispatchNotification(notification)
+    {
+        if (this._testDone)
+            return;
+        if (notification.method !== "Console.messageAdded")
+            return;
+        var text = notification.params.message.text;
+        if (!text.startsWith("#devtools-tests#"))
+            return;
+
+        var command = JSON.parse(text.substring("#devtools-tests#".length));
+        if (command.method === "evaluateInWebInspector") {
+            this._frontend.evaluateInWebInspector(command.args[1]);
+        } else if (command.method === "notifyDone") {
+            this._testDone = true;
+            this._frontend.disconnect();
+            clearTimeout(this._watchdog);
+            this._connection.sendCommand("Runtime.enable");
+            this._connection.sendCommand("Runtime.evaluate", { expression: "document.documentElement.innerText" }).then(response => {
+                var actual = response.result.result.value + "\n";
+                if (actual === this._expected)
+                    this._callback("SUCCESS");
+                else
+                    this._callback("FAILURE");
+            });
+        }
+    }
+}
+
+var frontend;
+var testRunner;
 var tests = [];
 
-fs.readdir(testsPath, function(err, items) { 
-    for (var item of items) {
-    	if (item.endsWith(".html"))
-    		tests.push(testsPath + "/" + item);
-    }
-    runTests();
+server.closeTabs().then(() => {
+    setTimeout(() => {
+        Promise.all([server.newTab(), server.newTab()]).then(mixers => {
+            frontend = new Frontend(mixers[0], mixers[1]);
+            testRunner = new TestRunner(frontend, mixers[1]);
+            Promise.all([frontend.init(), testRunner.init()]).then(() => {
+                fs.readdir(testsPath, function(err, items) {
+                    for (var item of items) {
+                        if (item.endsWith(".html"))
+                            tests.push(testsPath + "/" + item);
+                    }
+                    runTests();
+                });
+            });
+        });
+    }, 1000);
 });
 
 function runTests()
 {
-	if (!tests.length)
-		process.exit(0);
-	var test = tests.shift();
-	console.log("Running " + test + "...");
-    runTest(test).then(result => {
-    	console.log(result);
-    	runTests();
-    }).catch(() => {
-    	console.log("TIMEOUT");
-    	runTests();
+    if (!tests.length)
+        process.exit(0);
+    var testPath = tests.shift();
+    console.log("Running " + testPath + "...");
+    frontend.reload(testPath);
+    testRunner.runTest(testPath, result => {
+        console.log(result);
+        runTests();
     });
 }
