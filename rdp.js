@@ -95,9 +95,9 @@ RDPConnection.prototype = {
     {
 		return new Promise((fulfill, reject) => {
 			this._requests.set(object.id, fulfill);
-    		this._mixer._sendJSON(this, object);
     		if (log)
         		console.log(this._name + " => " + object.id + " " + object.method);
+    		this._mixer._sendJSON(this, object);
         });
     },
 
