@@ -104,35 +104,43 @@ Frontend.prototype = {
     }
 }
 
-function TestRunner(backend)
+function TestRunner(paths)
 {
-    this._successCount = 0;
-    this._failedCount = 0;
-    this._timedOutCount = 0;
+    this._paths = paths;
+    TestRunner._successCount = 0;
 }
 
+TestRunner._successCount = 0;
+TestRunner._failedCount = 0;
+TestRunner._timedOutCount = 0;
+
 TestRunner.prototype = {
-    init: function()
+    run: function()
     {
-        return Promise.all([server.newTab(), server.newTab()]).then(mixers => {
-            this._connection = mixers[1].fork("testRunner");
-            this._connection.on("notification", this._dispatchNotification.bind(this));
-            this._frontend = new Frontend(mixers[0], mixers[1]);
-            return this._frontend.init();
+        return new Promise((fulfill, reject) => {
+            this._completeCallback = fulfill;
+            Promise.all([server.newTab(), server.newTab()]).then(mixers => {
+                this._connection = mixers[1].fork("testRunner");
+                this._connection.on("notification", this._dispatchNotification.bind(this));
+                this._frontend = new Frontend(mixers[0], mixers[1]);
+                this._frontend.init().then(this._innerRunTests.bind(this));
+            });
         });
     },
 
-    runTests(paths)
+    _innerRunTests()
     {
-        if (!paths.length)
-            process.exit(0);
-        var testPath = paths.shift();
-        console.log("Running " + testPath + "...");
-        this._runTest(testPath, this.runTests.bind(this, paths));
+        if (!this._paths.length) {
+            this._completeCallback();
+            return;
+        }
+        var testPath = this._paths.shift();
+        this._runTest(testPath, this._innerRunTests.bind(this));
     },
 
     _runTest(testPath, callback)
     {
+        this._currentTest = testPath;
         this._watchdog = setTimeout(this._timeout.bind(this), 5000);
 
         // Reattach to reset backend state.
@@ -188,17 +196,18 @@ TestRunner.prototype = {
                 } else {
                     this._fail();
                     this._callback();
-                    // var dmp = new diff_match_patch();
-                    // var a = dmp.diff_linesToChars_(this._expected, actual);
-                    // var diffs = dmp.diff_main(a.chars1, a.chars2, false);
-                    // dmp.diff_charsToLines_(diffs, a.lineArray);
-                    // var diffText = "";
-                    // for (var diff of diffs) {
-                    //     if (diff[0] === 1)
-                    //         diffText += "\n+" + diff[1].split("\n").join("\n+");
-                    //     else if (diff[0] === -1)
-                    //         diffText += "\n-" + diff[1].split("\n").join("\n-");
-                    // }
+                    var dmp = new diff_match_patch();
+                    var a = dmp.diff_linesToChars_(this._expected, actual);
+                    var diffs = dmp.diff_main(a.chars1, a.chars2, false);
+                    dmp.diff_charsToLines_(diffs, a.lineArray);
+                    var diffText = "";
+                    for (var diff of diffs) {
+                        if (diff[0] === 1)
+                            diffText += "\n+" + diff[1].split("\n").join("\n+");
+                        else if (diff[0] === -1)
+                            diffText += "\n-" + diff[1].split("\n").join("\n-");
+                    }
+                    console.log(diffText);
                 }
             });
         }
@@ -211,28 +220,30 @@ TestRunner.prototype = {
         clearTimeout(this._watchdog);
     },
 
-    _stats()
+    _stats(result)
     {
-        return "S:" + this._successCount + " F:" + this._failedCount + " T:" + this._timedOutCount;
+        var path = this._currentTest.replace(/.*LayoutTests\//, "");
+        var stats = "// S:" + TestRunner._successCount + " F:" + TestRunner._failedCount + " T:" + TestRunner._timedOutCount;
+        console.log(path + "...[" + result + "] " + stats);
     },
 
     _succeed()
     {
-        this._successCount++;
-        console.log("SUCCESS " + this._stats());
+        TestRunner._successCount++;
+        this._stats("SUCCESS");
     },
 
     _fail()
     {
-        this._failedCount++;
-        console.log("FAILED " + this._stats());
+        TestRunner._failedCount++;
+        this._stats("FAILED");
     },
 
     _timeout()
     {
         this._completeTest();
-        this._timedOutCount++;
-        console.log("TIMEOUT " + this._stats());
+        TestRunner._timedOutCount++;
+        this._stats("TIMEOUT");
         this._callback();
     }
 }
@@ -259,14 +270,20 @@ function collectFiles(path)
     });
 }
 
-var testRunner = new TestRunner();
-
 Promise.all(testPaths.map(path => collectFiles(path))).then(() => {
-    console.log("Running " + tests.length + " tests...");
+    var jobs = argv["j"] || 1;
+    console.log("Running " + tests.length + " tests using " + jobs + " jobs ...");
+    var jobSize = Math.ceil(tests.length / jobs);
     server.closeTabs().then(() => {
         setTimeout(() => {
-            testRunner.init().then(() => {
-                testRunner.runTests(tests);
+            var promises = [];
+            for (var i = 0; i < jobs; ++i) {
+                var testRunner = new TestRunner(tests.slice(jobSize * i, jobSize * (i + 1)));
+                promises.push(testRunner.run());
+            }
+            Promise.all(promises).then(() => {
+                console.log("Succeeded: " + TestRunner._successCount + ", Failed: " + TestRunner._failedCount + ", Timed out: " + TestRunner._timedOutCount);
+                process.exit(0)
             });
         }, 1000);
     });
