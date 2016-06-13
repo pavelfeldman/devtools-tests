@@ -36,4 +36,5 @@ module.exports = function() {
         }
     };
     window.testRunner = new TestRunner();
+    window.alert = function() {};
 }

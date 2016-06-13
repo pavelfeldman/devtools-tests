@@ -139,7 +139,7 @@ TestRunner.prototype = {
     _runTest(testPath, callback)
     {
         this._currentTest = testPath;
-        this._watchdog = setTimeout(this._timeout.bind(this), 5000);
+        this._watchdog = setTimeout(this._timeout.bind(this), 10000);
 
         // Reattach to reset backend state.
         this._connection.reconnect();
