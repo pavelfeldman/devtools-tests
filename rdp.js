@@ -6,7 +6,7 @@ var events = require("events");
 var http = require("http");
 var WebSocket = require("ws");
 
-var log = false;
+var logTransport = false;
 
 module.exports = {
     Connection: RDPConnection,
@@ -16,35 +16,50 @@ module.exports = {
 
 function RDPConnectionMixer(wsurl)
 {
-    this._id = 0;
-    this._requests = new Map();
     this._wsurl = wsurl;
     this._forkedConnections = new Set();
+    this._pendingMessages = [];
+    this._pendingCallbacks = new Map();
+    this._id = 0;
 }
 
 RDPConnectionMixer.prototype = {
-    fork: function(name)
+    fork(name)
     {
         var connection = new RDPConnection(this, name);
         this._forkedConnections.add(connection);
         return connection;
     },
 
-    reset: function()
+    reconnect()
+    {
+        this._pendingMessages = [];
+        this._pendingCallbacks.clear();
+        this._resetConnection();
+    },
+
+    _resetConnection()
     {
         if (this._ws)
             this._ws.close();
+        this._ws = null;
         this._id = 0;
-        this._requests.clear();
-
-        this._ws = new WebSocket(this._wsurl);
-        this._ws.on("message", message => this._dispatchMessage(message));
-        return new Promise((fulfill, reject) => {
-            this._ws.on("open", fulfill);
-        });
+        this._initPromise = null;
     },
 
-    release: function(connection)
+    init()
+    {
+        if (!this._initPromise) {
+            this._initPromise = new Promise((fulfill, reject) => {
+                this._ws = new WebSocket(this._wsurl);
+                this._ws.on("message", message => this._dispatchMessage(message));
+                this._ws.on("open", fulfill);
+            });
+        }
+        return this._initPromise;
+    },
+
+    release(connection)
     {
         this._forkedConnections.delete(connection);
     },
@@ -52,9 +67,35 @@ RDPConnectionMixer.prototype = {
     _sendJSON(client, message)
     {
         var id = ++this._id;
-        this._requests.set(id, [client, message.id]);
+        this._pendingCallbacks.set(id, [client, message.id]);
         message.id = id;
-        this._ws.send(JSON.stringify(message));
+        this._pendingMessages.push(message);
+        this._sendPendingMessages();
+    },
+
+    _sendPendingMessages()
+    {
+        if (!this._pendingMessages.length)
+            return;
+        this._sendMessage(this._pendingMessages.shift()).then(this._sendPendingMessages.bind(this));
+    },
+
+   _sendMessage(message)
+    {
+        return new Promise((fulfill, reject) => {
+            this.init().then(() => {
+                this._ws.send(JSON.stringify(message), error => {
+                    if (!error) {
+                        fulfill();
+                        return;
+                    }
+                    this._resetConnection();
+                    setTimeout(() => {
+                        this._sendMessage(message).then(fulfill);
+                    }, 100);
+                });
+            });
+        });
     },
 
     _dispatchMessage(data)
@@ -66,9 +107,9 @@ RDPConnectionMixer.prototype = {
             return;
         }
 
-        var data = this._requests.get(message.id);
+        var data = this._pendingCallbacks.get(message.id);
         if (data) {
-            this._requests.delete(message.id);
+            this._pendingCallbacks.delete(message.id);
             message.id = data[1];
             data[0]._dispatchJSON(message);
         }
@@ -85,11 +126,11 @@ function RDPConnection(mixer, name)
 }
 
 RDPConnection.prototype = {
-    reset: function()
+    reconnect: function()
     {
-        if (log)
-            console.log(this._name + " ==== [RESET] ===");
-        return this._mixer.reset();
+        if (logTransport)
+            console.log(this._name + " ==== [reconnect] ===");
+        return this._mixer.reconnect();
     },
 
     sendCommand(method, params)
@@ -105,7 +146,7 @@ RDPConnection.prototype = {
     {
         return new Promise((fulfill, reject) => {
             this._requests.set(object.id, fulfill);
-            if (log)
+            if (logTransport)
                 console.log(this._name + " => " + object.id + " " + object.method);
             this._mixer._sendJSON(this, object);
         });
@@ -113,7 +154,7 @@ RDPConnection.prototype = {
 
     _dispatchJSON(message)
     {
-        if (log)
+        if (logTransport)
             console.log(this._name + " <= " + (message.id || "") + " " + (message.method || ""));
         if (!("id" in message)) {
             this.emit("notification", message);
@@ -145,12 +186,15 @@ RDPServer.prototype = {
         });
     },
 
-    newTab()
+    newTab(activate)
     {
         return this._sendRequest("new").then(result => {
-            var wsurl = JSON.parse(result).webSocketDebuggerUrl;
+            var response = JSON.parse(result);
+            var wsurl = response.webSocketDebuggerUrl;
+            if (activate)
+                this._sendRequest("activate/" + response.id);
             var mixer = new RDPConnectionMixer(wsurl);
-            return mixer.reset().then(() => mixer);
+            return mixer.init().then(() => mixer);
         });
     },
 

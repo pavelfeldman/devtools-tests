@@ -26,12 +26,10 @@ function Frontend(frontend, backend)
 Frontend.prototype = {
     init()
     {
-        return Promise.all([this._connection.sendCommand("Console.enable"),
-                     this._connection.sendCommand("Page.enable"),
-                     this._connection.sendCommand("Network.setCacheDisabled", { cacheDisabled: true }),
-                     this._connection.sendCommand("Runtime.enable")]).then(() => {
-            return this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + frontendPatch + ")()" });
-        });
+        this._connection.sendCommand("Console.enable");
+        this._connection.sendCommand("Page.enable"),
+        this._connection.sendCommand("Runtime.enable");
+        return this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + frontendPatch + ")()" });
     },
 
     setInspected(inspected)
@@ -119,10 +117,10 @@ TestRunner.prototype = {
     {
         return new Promise((fulfill, reject) => {
             this._completeCallback = fulfill;
-            Promise.all([server.newTab(), server.newTab()]).then(mixers => {
-                this._connection = mixers[1].fork("testRunner");
+            Promise.all([server.newTab(), server.newTab(true)]).then(mixers => {
+                this._connection = mixers[0].fork("testRunner");
                 this._connection.on("notification", this._dispatchNotification.bind(this));
-                this._frontend = new Frontend(mixers[0], mixers[1]);
+                this._frontend = new Frontend(mixers[1], mixers[0]);
                 this._frontend.init().then(this._innerRunTests.bind(this));
             });
         });
@@ -144,20 +142,19 @@ TestRunner.prototype = {
         this._watchdog = setTimeout(this._timeout.bind(this), 5000);
 
         // Reattach to reset backend state.
-        this._connection.reset().then(() => {
-            this._connection.sendCommand("Page.enable");
-            this._connection.sendCommand("Console.enable");
-            this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(() => {
-                var expectationsPath = testPath.replace(".html", "-expected.txt");
-                fs.readFile(expectationsPath, "utf8", (err, data) => {
-                    var lines = data.split("\n");
-                    lines = lines.filter(line => !line.startsWith("CONSOLE MESSAGE"));
-                    this._expected = lines.join("\n");
-                    this._testDone = false;
-                    this._callback = callback;
-                    this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
-                    this._frontend.reload(testPath);
-                });
+        this._connection.reconnect();
+        this._connection.sendCommand("Page.enable");
+        this._connection.sendCommand("Console.enable");
+        this._connection.sendCommand("Page.addScriptToEvaluateOnLoad", { scriptSource: "(" + testRunnerPatch + ")()" }).then(() => {
+            var expectationsPath = testPath.replace(".html", "-expected.txt");
+            fs.readFile(expectationsPath, "utf8", (err, data) => {
+                var lines = data.split("\n");
+                lines = lines.filter(line => !line.startsWith("CONSOLE "));
+                this._expected = lines.join("\n");
+                this._testDone = false;
+                this._callback = callback;
+                this._connection.sendCommand("Page.navigate", { url: "file://" + testPath});
+                this._frontend.reload(testPath);
             });
         });
     },
@@ -207,7 +204,8 @@ TestRunner.prototype = {
                         else if (diff[0] === -1)
                             diffText += "\n-" + diff[1].split("\n").join("\n-");
                     }
-                    console.log(diffText);
+                    if (argv["show-diff"])
+                        console.log(diffText);
                 }
             });
         }
